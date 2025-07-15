@@ -1,0 +1,205 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models, transforms
+from PIL import Image
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+import time
+from scipy.stats import entropy, pearsonr, spearmanr
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import wasserstein_distance
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+#pathway 
+DATA_DIR = os.path.expanduser('~/thesis_data')
+CSV_DIR = os.path.join(DATA_DIR, 'csv')
+IMG_DIRS = {split: os.path.join(DATA_DIR, split) for split in ['train', 'val', 'test']}
+MODEL_SAVE = os.path.join(DATA_DIR, 'models', 'finetune_resnet50_softlabel.pth')
+BATCH_SIZE = 32
+NUM_CLASSES = 21
+IMG_SIZE = 224
+EPOCHS = 30
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+PATIENCE = 8
+best_val_loss = float('inf')
+patience_counter = 0
+log_list = []
+
+
+#set data
+class ImageSoftLabelDataset(Dataset):
+    def __init__(self, csv_path, img_dir, transform=None):
+        df = pd.read_csv(csv_path)
+        self.img_dir = img_dir
+        self.image_names = df['image_name'].values
+        self.owners = df['owner'].values
+        label_cols = [c for c in df.columns if c not in ['image_name', 'owner', 'split']]
+        self.labels = df[label_cols].values.astype(np.float32)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_names)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.image_names[idx])
+        img = Image.open(img_path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        owner = self.owners[idx]
+        return img, label, owner
+
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+train_set = ImageSoftLabelDataset(os.path.join(CSV_DIR, 'train_labels.csv'), IMG_DIRS['train'], transform)
+val_set = ImageSoftLabelDataset(os.path.join(CSV_DIR, 'val_labels.csv'), IMG_DIRS['val'], transform)
+train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+#load model
+resnet = models.resnet50(weights="IMAGENET1K_V1")
+for param in resnet.parameters():
+    param.requires_grad = False
+for param in resnet.layer4.parameters():
+    param.requires_grad = True
+in_features = resnet.fc.in_features
+resnet.fc = nn.Sequential(
+    nn.Linear(in_features, 512),
+    nn.ReLU(),
+    nn.Dropout(0.5),
+    nn.Linear(512, NUM_CLASSES)
+)
+model = resnet.to(DEVICE)
+
+optimizer = optim.Adam([
+    {'params': resnet.layer4.parameters(), 'lr': 1e-5},
+    {'params': resnet.fc.parameters(), 'lr': 1e-4}
+])
+# -- loss用KL --
+class WeightedKLDivLoss(nn.Module):
+    def __init__(self, reduction='batchmean'):
+        super().__init__()
+        self.kl = nn.KLDivLoss(reduction=reduction)
+    def forward(self, input, target):
+        return self.kl(input, target)
+
+criterion = WeightedKLDivLoss()
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
+
+#evaluation
+def eval_metrics(probs, targets, topk=3):
+    results = {}
+    eps = 1e-10
+    KLs = [entropy(t + eps, p + eps) for t, p in zip(targets, probs)]
+    results['KL(mean)'] = np.mean(KLs)
+    JSs = [jensenshannon(t + eps, p + eps)**2 for t, p in zip(targets, probs)]
+    results['JS(mean)'] = np.mean(JSs)
+    EMDs = [wasserstein_distance(t, p) for t, p in zip(targets, probs)]
+    results['EMD(mean)'] = np.mean(EMDs)
+    cosines = [
+        np.dot(t, p) / (np.linalg.norm(t) * np.linalg.norm(p) + 1e-8)
+        for t, p in zip(targets, probs)
+    ]
+    results['Cosine(mean)'] = np.mean(cosines)
+    r_pearson = pearsonr(targets.flatten(), probs.flatten())[0]
+    r_spearman = spearmanr(targets.flatten(), probs.flatten())[0]
+    results['Pearson_r'] = r_pearson
+    results['Spearman_r'] = r_spearman
+    def topk_acc(k):
+        pred_topk = np.argpartition(probs, -k, axis=1)[:, -k:]
+        true_topk = np.argpartition(targets, -k, axis=1)[:, -k:]
+        hits = [len(set(pred_topk[i]) & set(true_topk[i])) > 0 for i in range(len(probs))]
+        return np.mean(hits)
+    results['Top-1 Acc'] = topk_acc(1)
+    results['Top-3 Acc'] = topk_acc(3)
+    per_class_kl = np.mean([
+        entropy(targets[:,i]+eps, probs[:,i]+eps)
+        for i in range(targets.shape[1])
+    ])
+    results['Per-class KL(mean)'] = per_class_kl
+    return results
+
+# aggegreate back to owner level
+def get_owner_metrics(model, loader):
+    model.eval()
+    owner_probs = defaultdict(list)
+    owner_targets = {}
+    with torch.no_grad():
+        for imgs, labels, owners in loader:
+            imgs = imgs.to(DEVICE)
+            logits = model(imgs)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            for i, owner in enumerate(owners):
+                owner_probs[owner].append(probs[i])
+                owner_targets[owner] = labels[i].cpu().numpy()
+  
+    all_probs, all_targets = [], []
+    for owner in owner_probs:
+        probs = np.stack(owner_probs[owner]).mean(axis=0)
+        all_probs.append(probs)
+        all_targets.append(owner_targets[owner])
+    all_probs = np.stack(all_probs)
+    all_targets = np.stack(all_targets)
+    return eval_metrics(all_probs, all_targets)
+
+# train start
+for epoch in range(EPOCHS):
+    t0 = time.time()
+    model.train()
+    total_loss = 0.0
+    for imgs, labels, owners in train_loader:
+        imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+        optimizer.zero_grad()
+        logits = model(imgs)
+        log_probs = torch.log_softmax(logits, dim=1)
+        loss = criterion(log_probs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * imgs.size(0)
+    avg_loss = total_loss / len(train_set)
+    t1 = time.time()
+
+    metrics_train = get_owner_metrics(model, train_loader)
+    metrics_val = get_owner_metrics(model, val_loader)
+
+    print(f"\nEpoch {epoch+1:2d} | Train Loss: {avg_loss:.4f} | Time: {t1-t0:.1f}s")
+    print("Train metrics:")
+    for k, v in metrics_train.items():
+        print(f"  {k:18s}: {v:.4f}")
+    print("Val metrics:")
+    for k, v in metrics_val.items():
+        print(f"  {k:18s}: {v:.4f}")
+
+    
+    log_entry = {
+        "epoch": epoch+1, "train_loss": avg_loss, "val_loss": metrics_val['KL(mean)'], "time": t1-t0
+    }
+    for k, v in metrics_train.items():
+        log_entry[f"train_{k}"] = v
+    for k, v in metrics_val.items():
+        log_entry[f"val_{k}"] = v
+    log_list.append(log_entry)
+    pd.DataFrame(log_list).to_csv(os.path.join(CSV_DIR, 'log_finetune_resnet50_softlabel.csv'), index=False)
+
+
+    if metrics_val['KL(mean)'] < best_val_loss:
+        best_val_loss = metrics_val['KL(mean)']
+        patience_counter = 0
+        torch.save(model.state_dict(), MODEL_SAVE)
+        print("Best model saved!")
+    else:
+        patience_counter += 1
+        print(f"Early stopping patience: {patience_counter}/{PATIENCE}")
+        if patience_counter >= PATIENCE:
+            print("Early stopping triggered. Training finished.")
+            break
+    scheduler.step(metrics_val['KL(mean)'])
+
